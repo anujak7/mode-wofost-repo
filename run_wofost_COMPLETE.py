@@ -6,18 +6,14 @@ Date: Jan to June 2024
 from pcse.models import Wofost72_WLP_FD
 from pcse.input import (
     CSVWeatherDataProvider,
-    YAMLCropDataProvider,
     YAMLAgroManagementReader,
-    WOFOST72SiteDataProvider,
-    DummySoilDataProvider
+    WOFOST72SiteDataProvider
 )
 from pcse.base import ParameterProvider
 import argparse
 import csv
 from datetime import datetime
-import glob
 import os
-import shutil
 import sys
 import yaml
 
@@ -40,28 +36,9 @@ def _resolve_path(path_value):
 
 
 def _select_weather_file(weather_arg):
-    if weather_arg:
-        return _resolve_path(weather_arg)
-
-    weather_dir = os.path.join(BASE_DIR, "weather")
-    preferred = [
-        "weather_pcse_2014_2034.csv",
-        "weather.csv",
-    ]
-    for name in preferred:
-        candidate = os.path.join(weather_dir, name)
-        if os.path.exists(candidate):
-            return candidate
-
-    csv_files = sorted(glob.glob(os.path.join(weather_dir, "*.csv")))
-    if len(csv_files) == 1:
-        return csv_files[0]
-    if len(csv_files) == 0:
-        raise FileNotFoundError(f"No CSV weather files found in {weather_dir}")
-    raise RuntimeError(
-        "Multiple weather CSV files found. Pass --weather explicitly. "
-        + ", ".join(os.path.basename(p) for p in csv_files)
-    )
+    if not weather_arg:
+        raise RuntimeError("Weather file path is required.")
+    return _resolve_path(weather_arg)
 
 
 def _parse_weather_day(raw_value):
@@ -111,39 +88,38 @@ def _prepare_weather_for_pcse(input_weather_file):
         key, value = line.split("=", 1)
         metadata[key.strip()] = value.strip()
 
-    fallback_metadata = {
-        "Country": "'India'",
-        "Station": "'Unknown station'",
-        "Description": "'Weather data for WOFOST simulation'",
-        "Source": "'User dataset'",
-        "Contact": "'User'",
-        "Longitude": "74.792",
-        "Latitude": "29.758",
-        "Elevation": "216",
-        "AngstromA": "0.29",
-        "AngstromB": "0.49",
-        "HasSunshine": "False",
-    }
+    required_metadata = [
+        "Country", "Station", "Description", "Source", "Contact",
+        "Longitude", "Latitude", "Elevation", "AngstromA", "AngstromB", "HasSunshine"
+    ]
     merged_metadata = {}
-    for key, fallback in fallback_metadata.items():
-        merged_metadata[key] = _to_literal_string(key, metadata.get(key, fallback))
+    missing_metadata = [key for key in required_metadata if key not in metadata]
+    if missing_metadata:
+        raise RuntimeError(
+            "Missing required weather metadata keys in input file: "
+            + ", ".join(missing_metadata)
+        )
+    for key in required_metadata:
+        merged_metadata[key] = _to_literal_string(key, metadata[key])
 
     weather_rows = []
     start_day = None
     end_day = None
-    for raw in lines[header_idx + 1:]:
+    max_vap = None
+    for row_idx, raw in enumerate(lines[header_idx + 1:], start=header_idx + 2):
         line = raw.strip()
         if not line:
             continue
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 8:
-            continue
+            raise RuntimeError(
+                f"Invalid weather row at line {row_idx}: expected at least 8 columns, got {len(parts)}"
+            )
         day = _parse_weather_day(parts[0])
         values = [float(v) for v in parts[1:8]]
         irrad, tmin, tmax, vap, wind, rain, snowdepth = values
-        # Many external datasets provide vapour pressure already in hPa-scale.
-        if vap > 40:
-            vap = vap / 10.0
+        if max_vap is None or vap > max_vap:
+            max_vap = vap
         weather_rows.append(
             (
                 day.strftime("%Y-%m-%d"),
@@ -164,6 +140,14 @@ def _prepare_weather_for_pcse(input_weather_file):
     if not weather_rows:
         raise RuntimeError("No weather observations found after parsing weather file.")
 
+    # PCSE CSVWeatherDataProvider expects VAP in kPa and internally multiplies by 10.
+    # If input looks like hPa-scale values (~90-110), normalize to kPa using same source data.
+    if max_vap is not None and max_vap > 30.0:
+        normalized_rows = []
+        for day, irrad, tmin, tmax, vap, wind, rain, snowdepth in weather_rows:
+            normalized_rows.append((day, irrad, tmin, tmax, vap / 10.0, wind, rain, snowdepth))
+        weather_rows = normalized_rows
+
     prepared_weather_file = os.path.join(RUNTIME_DIR, "weather_prepared_pcse.csv")
     with open(prepared_weather_file, "w", encoding="utf-8", newline="") as fp:
         fp.write("## Station data\n")
@@ -180,55 +164,14 @@ def _prepare_weather_for_pcse(input_weather_file):
     return prepared_weather_file, start_day, end_day, len(weather_rows)
 
 
-def _select_local_crop_file(crop_dir, selected_crop_name, agro_crop_name):
-    if not os.path.isdir(crop_dir):
-        return None
-    yaml_files = sorted(
-        f for f in os.listdir(crop_dir)
-        if f.lower().endswith(".yaml") and f.lower() != "crops.yaml"
-    )
-    if not yaml_files:
-        return None
-    if len(yaml_files) == 1:
-        return os.path.join(crop_dir, yaml_files[0])
-
-    preferred = [
-        f"{selected_crop_name}.yaml" if selected_crop_name else None,
-        f"{agro_crop_name}.yaml" if agro_crop_name else None,
-        "wheat.yaml",
-        "winter_wheat.yaml",
-    ]
-    for name in preferred:
-        if name and name in yaml_files:
-            return os.path.join(crop_dir, name)
-    return None
-
-
-def _build_single_file_crop_repo(crop_yaml_file, selected_crop_name):
-    staged_crop_dir = os.path.join(RUNTIME_DIR, "crop_repo")
-    os.makedirs(staged_crop_dir, exist_ok=True)
-    staged_crop_file = os.path.join(staged_crop_dir, f"{selected_crop_name}.yaml")
-    shutil.copyfile(crop_yaml_file, staged_crop_file)
-    with open(os.path.join(staged_crop_dir, "crops.yaml"), "w", encoding="utf-8") as fp:
-        fp.write("available_crops:\n")
-        fp.write(f"- {selected_crop_name}\n")
-    return staged_crop_dir
-
-
 def _unwrap_pcse_value(raw_value):
-    # Official PCSE YAML stores parameters as [value, description, units].
+    # Official PCSE YAML stores parameters as [value, description, units]
     if isinstance(raw_value, list) and len(raw_value) >= 2 and isinstance(raw_value[1], str):
         return raw_value[0]
     return raw_value
 
 
-def _extract_local_crop_overrides(
-    crop_yaml_file,
-    selected_crop_name,
-    selected_variety_name,
-    agro_crop_name,
-    agro_variety_name,
-):
+def _load_crop_from_local_file(crop_yaml_file):
     with open(crop_yaml_file, "r", encoding="utf-8") as fp:
         crop_doc = yaml.safe_load(fp) or {}
 
@@ -236,108 +179,53 @@ def _extract_local_crop_overrides(
     if not isinstance(crop_parameters, dict):
         raise RuntimeError("Missing 'CropParameters' block in local crop file.")
 
-    varieties = crop_parameters.get("Varieties")
-    if isinstance(varieties, dict) and len(varieties) > 0:
-        preferred_varieties = [selected_variety_name, agro_variety_name]
-        variety_name = next(
-            (name for name in preferred_varieties if name and name in varieties),
-            next(iter(varieties))
-        )
-        raw_parameters = varieties[variety_name]
-        if not isinstance(raw_parameters, dict):
-            raise RuntimeError(f"Variety '{variety_name}' is not a mapping.")
-        overrides = {
-            key: _unwrap_pcse_value(value)
-            for key, value in raw_parameters.items()
-            if key != "Metadata"
-        }
-        return overrides, f"local variety '{variety_name}'"
+    selected_name = "winter_wheat"
+    raw_parameters = None
 
     ecotypes = crop_parameters.get("EcoTypes")
     if isinstance(ecotypes, dict) and len(ecotypes) > 0:
-        preferred_ecotypes = [
-            agro_variety_name,
-            selected_variety_name,
-            agro_crop_name,
-            selected_crop_name,
-            "winter_wheat",
-            "wheat",
-        ]
-        ecotype_name = next(
-            (name for name in preferred_ecotypes if name and name in ecotypes),
-            next(iter(ecotypes))
+        raw_parameters = ecotypes.get(selected_name)
+        if raw_parameters is None and len(ecotypes) == 1:
+            selected_name, raw_parameters = next(iter(ecotypes.items()))
+
+    if raw_parameters is None:
+        varieties = crop_parameters.get("Varieties")
+        if isinstance(varieties, dict) and len(varieties) > 0:
+            raw_parameters = varieties.get(selected_name)
+            if raw_parameters is None and len(varieties) == 1:
+                selected_name, raw_parameters = next(iter(varieties.items()))
+
+    if raw_parameters is None or not isinstance(raw_parameters, dict):
+        raise RuntimeError(
+            "Could not find crop parameters for 'winter_wheat' in local crop file "
+            "(expected CropParameters -> EcoTypes/Varieties)."
         )
-        raw_parameters = ecotypes[ecotype_name]
-        if not isinstance(raw_parameters, dict):
-            raise RuntimeError(f"EcoType '{ecotype_name}' is not a mapping.")
-        overrides = {
-            key: _unwrap_pcse_value(value)
-            for key, value in raw_parameters.items()
-            if key != "Metadata"
-        }
-        return overrides, f"local ecotype '{ecotype_name}'"
 
-    raise RuntimeError("No supported 'Varieties' or 'EcoTypes' section found in local crop file.")
-
-
-def _load_remote_crop_baseline(selected_crop_name, selected_variety_name):
-    remote_crop = YAMLCropDataProvider()
-    candidate_pairs = [
-        (selected_crop_name, selected_variety_name),
-        ("wheat", "Winter_wheat_101"),
-    ]
-    last_error = None
-    for crop_name, variety_name in candidate_pairs:
-        try:
-            remote_crop.set_active_crop(crop_name, variety_name)
-            return dict(remote_crop), crop_name, variety_name
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"Could not load remote baseline crop defaults: {last_error}")
-
-
-def _build_local_cropdata_with_remote_defaults(
-    crop_yaml_file,
-    selected_crop_name,
-    selected_variety_name,
-    agro_crop_name,
-    agro_variety_name,
-):
-    overrides, local_source = _extract_local_crop_overrides(
-        crop_yaml_file=crop_yaml_file,
-        selected_crop_name=selected_crop_name,
-        selected_variety_name=selected_variety_name,
-        agro_crop_name=agro_crop_name,
-        agro_variety_name=agro_variety_name,
-    )
-    baseline, baseline_crop, baseline_variety = _load_remote_crop_baseline(
-        selected_crop_name=selected_crop_name,
-        selected_variety_name=selected_variety_name,
-    )
-    merged = baseline.copy()
-    merged.update(overrides)
-    source = (
-        f"{local_source} from {crop_yaml_file} "
-        f"(merged with remote defaults {baseline_crop}/{baseline_variety})"
-    )
-    return merged, source
+    cropdata = {
+        key: _unwrap_pcse_value(value)
+        for key, value in raw_parameters.items()
+        if key != "Metadata"
+    }
+    return cropdata, selected_name
 
 parser = argparse.ArgumentParser(description="Run WOFOST simulation with selected weather and agromanagement files.")
-parser.add_argument("--weather", default=None, help="Weather CSV path (absolute or relative). If omitted, auto-detected.")
+parser.add_argument(
+    "--weather",
+    default=os.path.join("weather", "weather_pcse_2014_2034.csv"),
+    help="Weather CSV path (absolute or relative). Only this file is used for weather input.",
+)
 parser.add_argument("--agro", default=os.path.join("agromanagement", "agro.yaml"), help="Agromanagement YAML path (absolute or relative).")
-parser.add_argument("--crop-dir", default="crop", help="Local crop repository directory with crops.yaml.")
-parser.add_argument("--crop-file", default=None, help="Single local crop YAML file (e.g. crop/winter_wheat.yaml).")
+parser.add_argument(
+    "--crop-file",
+    default=os.path.join("crop", "winter_wheat.yaml"),
+    help="Local crop YAML path. Only this file is used for crop parameters.",
+)
 parser.add_argument("--soil-file", default=os.path.join("soil", "soil.yaml"), help="Local soil YAML file.")
-parser.add_argument("--crop-name", default=None, help="Crop name override (default: read from agro file or fallback to wheat).")
-parser.add_argument("--variety-name", default=None, help="Variety name override (default: read from agro file or fallback to Winter_wheat_101).")
-parser.add_argument("--use-remote-crop", action="store_true", help="Use remote crop repository instead of local crop directory.")
-parser.add_argument("--use-dummy-soil", action="store_true", help="Use DummySoilDataProvider instead of local soil YAML.")
 args = parser.parse_args()
 
 WEATHER_FILE = _select_weather_file(args.weather)
 AGRO_FILE = _resolve_path(args.agro)
-CROP_DIR = _resolve_path(args.crop_dir)
-CROP_FILE = _resolve_path(args.crop_file) if args.crop_file else None
+CROP_FILE = _resolve_path(args.crop_file)
 SOIL_FILE = _resolve_path(args.soil_file)
 
 # ============================================
@@ -350,11 +238,9 @@ if not os.path.exists(WEATHER_FILE):
     missing_files.append(f"    {WEATHER_FILE}")
 if not os.path.exists(AGRO_FILE):
     missing_files.append(f"    {AGRO_FILE}")
-if not args.use_remote_crop and CROP_FILE and not os.path.exists(CROP_FILE):
+if not os.path.exists(CROP_FILE):
     missing_files.append(f"    {CROP_FILE} (crop file)")
-if not args.use_remote_crop and not CROP_FILE and not os.path.exists(CROP_DIR):
-    missing_files.append(f"    {CROP_DIR} (crop directory)")
-if not args.use_dummy_soil and not os.path.exists(SOIL_FILE):
+if not os.path.exists(SOIL_FILE):
     missing_files.append(f"    {SOIL_FILE} (soil file)")
 
 if missing_files:
@@ -365,10 +251,8 @@ if missing_files:
 
 print(f"    Weather: {WEATHER_FILE}")
 print(f"    Agromanagement: {AGRO_FILE}")
-print(f"    Crop dir: {CROP_DIR}" + (" (ignored: --use-remote-crop)" if args.use_remote_crop else ""))
-if CROP_FILE:
-    print(f"    Crop file: {CROP_FILE}" + (" (ignored: --use-remote-crop)" if args.use_remote_crop else ""))
-print(f"    Soil file: {SOIL_FILE}" + (" (ignored: --use-dummy-soil)" if args.use_dummy_soil else ""))
+print(f"    Crop file: {CROP_FILE}")
+print(f"    Soil file: {SOIL_FILE}")
 print()
 
 # ============================================
@@ -429,143 +313,115 @@ except Exception as e:
 # 3. Crop
 print(" Loading crop parameters...")
 try:
-    agro_crop_name = None
-    agro_variety_name = None
-    if len(agro) > 0:
-        first_campaign = agro[0]
-        _, campaign = next(iter(first_campaign.items()))
-        crop_calendar = campaign.get("CropCalendar", {})
-        agro_crop_name = crop_calendar.get("crop_name")
-        agro_variety_name = crop_calendar.get("variety_name")
-
-    crop_alias = {
-        "winter_wheat": "wheat",
-    }
-    variety_alias = {
-        ("wheat", "winter_wheat"): "Winter_wheat_101",
-    }
-
-    selected_crop_name = args.crop_name or crop_alias.get(agro_crop_name, agro_crop_name) or "wheat"
-    default_variety_name = variety_alias.get((selected_crop_name, agro_variety_name), agro_variety_name)
-    selected_variety_name = args.variety_name or default_variety_name or "Winter_wheat_101"
-
-    if (agro_crop_name, agro_variety_name) != (selected_crop_name, selected_variety_name):
-        print(
-            "    Agromanagement crop mapping:"
-            f" {agro_crop_name}/{agro_variety_name}"
-            f" -> {selected_crop_name}/{selected_variety_name}"
-        )
-        # Keep agro and active crop in sync so crop_start signal does not fail.
-        for campaign_item in agro:
-            for _, campaign_data in campaign_item.items():
-                crop_calendar = campaign_data.get("CropCalendar")
-                if crop_calendar is None:
-                    continue
-                crop_calendar["crop_name"] = selected_crop_name
-                crop_calendar["variety_name"] = selected_variety_name
-
-    print(f"    Selected crop: {selected_crop_name} / {selected_variety_name}")
-    crop = None
-    crop_source = None
-
-    if not args.use_remote_crop:
-        crop_repo_dir = None
-        local_crop_file = CROP_FILE
-
-        if os.path.exists(os.path.join(CROP_DIR, "crops.yaml")):
-            crop_repo_dir = CROP_DIR
-        else:
-            if local_crop_file is None:
-                local_crop_file = _select_local_crop_file(CROP_DIR, selected_crop_name, agro_crop_name)
-            if local_crop_file:
-                crop_repo_dir = _build_single_file_crop_repo(local_crop_file, selected_crop_name)
-                print(f"    Using single crop file: {local_crop_file}")
-
-        if crop_repo_dir:
-            try:
-                crop = YAMLCropDataProvider(fpath=crop_repo_dir)
-                crop.set_active_crop(selected_crop_name, selected_variety_name)
-                crop_source = f"local repository ({crop_repo_dir})"
-            except Exception as local_repo_error:
-                print(f"    Local crop repository failed: {local_repo_error}")
-                if local_crop_file:
-                    print("    Attempting direct local crop parsing...")
-                    try:
-                        crop, crop_source = _build_local_cropdata_with_remote_defaults(
-                            crop_yaml_file=local_crop_file,
-                            selected_crop_name=selected_crop_name,
-                            selected_variety_name=selected_variety_name,
-                            agro_crop_name=agro_crop_name,
-                            agro_variety_name=agro_variety_name,
-                        )
-                    except Exception as local_file_error:
-                        print(f"    Direct local crop parsing failed: {local_file_error}")
-                        print("    Falling back to remote crop repository...")
-                else:
-                    print("    Falling back to remote crop repository...")
-        elif local_crop_file:
-            try:
-                crop, crop_source = _build_local_cropdata_with_remote_defaults(
-                    crop_yaml_file=local_crop_file,
-                    selected_crop_name=selected_crop_name,
-                    selected_variety_name=selected_variety_name,
-                    agro_crop_name=agro_crop_name,
-                    agro_variety_name=agro_variety_name,
-                )
-            except Exception as local_file_error:
-                print(f"    Direct local crop parsing failed: {local_file_error}")
-                print("    Falling back to remote crop repository...")
-        else:
-            print("    No local crop repository or crop file resolved. Falling back to remote crop repository...")
-
-    if crop is None:
-        crop = YAMLCropDataProvider()
-        crop.set_active_crop(selected_crop_name, selected_variety_name)
-        crop_source = "remote repository (official WOFOST crop parameters)"
-
-    print(f"    Crop source: {crop_source}")
+    crop, selected_profile = _load_crop_from_local_file(CROP_FILE)
+    print(f"    Crop source: local file ({CROP_FILE})")
+    print(f"    Selected profile: {selected_profile}")
+    print(f"    Loaded crop parameter keys: {len(crop)}")
     print("    Crop parameters loaded successfully!")
 except Exception as e:
     print(f"    Error loading crop: {e}")
-    print("    Tip: pass explicit crop with --crop-name and --variety-name if needed.")
+    print("    Tip: update crop/winter_wheat.yaml with all required WOFOST parameters.")
     sys.exit(1)
 
-DEFAULT_SITE_PARAMS = {
-    "SSMAX": 0.5,
-    "WAV": 20.0,
-    "NOTINF": 0.0,
-    "SSI": 0.0,
-    "SMLIM": 0.4,
-}
+REQUIRED_SITE_KEYS = ("SSMAX", "WAV", "NOTINF", "SSI", "SMLIM")
+REQUIRED_SOIL_KEYS = ("CRAIRC", "K0", "KSUB", "RDMSOL", "SM0", "SMFCF", "SMW", "SOPE")
 
-DEFAULT_SOIL_PARAMS = {
-    "CRAIRC": 0.06,
-    "K0": 10.0,
-    "KSUB": 10.0,
-    "RDMSOL": 120.0,
-    "SM0": 0.45,
-    "SMFCF": 0.35,
-    "SMW": 0.15,
-    "SOPE": 10.0,
-}
+
+def _read_required_float(name, source_nodes, source_label):
+    for node in source_nodes:
+        if isinstance(node, dict) and name in node:
+            try:
+                return float(node[name])
+            except (TypeError, ValueError):
+                raise RuntimeError(f"'{name}' in {source_label} is not a valid number: {node[name]}")
+    return None
+
+
+def _read_weighted_layer_value(layers, name, source_label):
+    if not isinstance(layers, list) or not layers:
+        return None
+
+    weighted_sum = 0.0
+    total_thickness = 0.0
+    previous_depth = 0.0
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        if "Depth" not in layer:
+            continue
+        try:
+            current_depth = float(layer["Depth"])
+        except (TypeError, ValueError):
+            raise RuntimeError(f"'Depth' in {source_label} is not a valid number: {layer['Depth']}")
+        thickness = current_depth - previous_depth
+        previous_depth = current_depth
+        if thickness <= 0:
+            continue
+        if name not in layer:
+            continue
+        try:
+            value = float(layer[name])
+        except (TypeError, ValueError):
+            raise RuntimeError(f"'{name}' in {source_label} is not a valid number: {layer[name]}")
+        weighted_sum += value * thickness
+        total_thickness += thickness
+
+    if total_thickness > 0:
+        return weighted_sum / total_thickness
+
+    simple_values = []
+    for layer in layers:
+        if isinstance(layer, dict) and name in layer:
+            try:
+                simple_values.append(float(layer[name]))
+            except (TypeError, ValueError):
+                raise RuntimeError(f"'{name}' in {source_label} is not a valid number: {layer[name]}")
+    if simple_values:
+        return sum(simple_values) / len(simple_values)
+
+    return None
 
 
 def _load_site_and_soil_from_yaml(soil_file):
     with open(soil_file, "r", encoding="utf-8") as fp:
         soil_doc = yaml.safe_load(fp) or {}
 
-    soil_params = soil_doc.get("SoilParameters", soil_doc)
-    site_node = soil_params.get("Site", {})
-    soil_node = soil_params.get("SoilPhysical", soil_params.get("Soil", {}))
+    soil_params = soil_doc.get("SoilParameters")
+    if not isinstance(soil_params, dict):
+        raise RuntimeError("Missing 'SoilParameters' mapping in soil YAML.")
 
-    site_values = {}
-    for key, default in DEFAULT_SITE_PARAMS.items():
-        site_values[key] = float(site_node.get(key, default))
+    site_node = soil_params.get("Site")
+    if not isinstance(site_node, dict):
+        raise RuntimeError("Missing 'SoilParameters -> Site' mapping in soil YAML.")
+
+    soil_node = soil_params.get("SoilPhysical", soil_params.get("Soil"))
+    if not isinstance(soil_node, dict):
+        raise RuntimeError("Missing 'SoilParameters -> SoilPhysical' mapping in soil YAML.")
+    layers = soil_params.get("Layers", [])
+
+    site_values = {
+        key: _read_required_float(key, [site_node], "SoilParameters -> Site")
+        for key in REQUIRED_SITE_KEYS
+    }
+
+    if any(value is None for value in site_values.values()):
+        missing_site = [k for k, v in site_values.items() if v is None]
+        raise RuntimeError("Missing required Site keys in soil YAML: " + ", ".join(missing_site))
 
     soil_values = {}
-    for key, default in DEFAULT_SOIL_PARAMS.items():
-        value = soil_node.get(key, soil_params.get(key, default))
-        soil_values[key] = float(value)
+    for key in REQUIRED_SOIL_KEYS:
+        value = _read_required_float(
+            key,
+            [soil_node, soil_params],
+            "SoilParameters -> SoilPhysical/SoilParameters",
+        )
+        if value is None and key in {"K0", "SM0", "SMFCF", "SMW"}:
+            value = _read_weighted_layer_value(layers, key, "SoilParameters -> Layers")
+        if value is None:
+            raise RuntimeError(
+                f"Missing required key '{key}' in SoilParameters -> SoilPhysical/SoilParameters/Layers"
+            )
+        soil_values[key] = value
 
     return site_values, soil_values
 
@@ -573,16 +429,11 @@ def _load_site_and_soil_from_yaml(soil_file):
 # 4. Site + Soil data
 print(" Creating site and soil parameters...")
 try:
-    if args.use_dummy_soil:
-        site_values = DEFAULT_SITE_PARAMS.copy()
-        site = WOFOST72SiteDataProvider(**site_values)
-        soil = DummySoilDataProvider()
-        print("    Soil source: DummySoilDataProvider()")
-    else:
-        site_values, soil = _load_site_and_soil_from_yaml(SOIL_FILE)
-        site = WOFOST72SiteDataProvider(**site_values)
-        print(f"    Soil source: local soil YAML ({SOIL_FILE})")
-        print("    Loaded soil keys: " + ", ".join(sorted(soil.keys())))
+    site_values, soil = _load_site_and_soil_from_yaml(SOIL_FILE)
+    site = WOFOST72SiteDataProvider(**site_values)
+    print(f"    Soil source: local soil YAML ({SOIL_FILE})")
+    print("    Loaded site keys: " + ", ".join(sorted(site_values.keys())))
+    print("    Loaded soil keys: " + ", ".join(sorted(soil.keys())))
 
     print("    Site parameters created successfully!")
     print("    Soil parameters created successfully!")
