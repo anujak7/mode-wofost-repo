@@ -1,0 +1,7 @@
+venv/
+myvenv/
+_runtime/
+.vscode/
+
+__pycache__/
+*.py[cod]

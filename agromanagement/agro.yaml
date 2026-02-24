@@ -1,0 +1,18 @@
+Version: 1.0
+
+AgroManagement:
+
+- 2030-10-01:
+
+    CropCalendar:
+      crop_name: winter_wheat
+      variety_name: winter_wheat
+
+      crop_start_date: 2030-11-15
+      crop_start_type: sowing
+
+      crop_end_type: maturity
+      max_duration: 330
+
+    TimedEvents: null
+    StateEvents: null

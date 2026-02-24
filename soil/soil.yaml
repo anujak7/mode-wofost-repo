@@ -1,0 +1,62 @@
+Version: 1.0.0
+
+Metadata:
+  Creator: DSSAT Direct Layer Conversion
+  Title: IN03113457 SandyLoam Soil
+  Date: 2026-02-18
+  Description: Direct layer-wise conversion from DSSAT soil file
+
+SoilParameters:
+ # Site-specific parameters
+  Site:
+    SSMAX: 0.5
+    SSI: 0.0
+    WAV: 46.6
+    NOTINF: 0.0
+    SMLIM: 0.39
+# Soil physical properties
+  SoilPhysical:
+    CRAIRC: 0.06
+    SOPE: 1.59
+    KSUB: 0.83
+
+  RDMSOL: 200
+
+ # Soil layers (if using multi-layer model)
+  Layers:
+
+    - Depth: 5
+      SMW: 0.098
+      SMFCF: 0.205
+      SM0: 0.385
+      K0: 1.59
+
+    - Depth: 15
+      SMW: 0.109
+      SMFCF: 0.217
+      SM0: 0.387
+      K0: 1.32
+
+    - Depth: 30
+      SMW: 0.122
+      SMFCF: 0.231
+      SM0: 0.390
+      K0: 1.05
+
+    - Depth: 60
+      SMW: 0.137
+      SMFCF: 0.246
+      SM0: 0.393
+      K0: 0.83
+
+    - Depth: 100
+      SMW: 0.135
+      SMFCF: 0.243
+      SM0: 0.392
+      K0: 0.87
+
+    - Depth: 200
+      SMW: 0.123
+      SMFCF: 0.228
+      SM0: 0.389
+      K0: 1.09
